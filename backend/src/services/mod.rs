@@ -91,5 +91,6 @@ pub mod curation_sync;
 pub mod health_monitor_service;
 pub mod lifecycle_service;
 pub mod metrics_service;
+pub mod pypi_metadata;
 pub mod scheduler_service;
 pub mod sync_worker;

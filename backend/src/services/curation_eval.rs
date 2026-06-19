@@ -171,7 +171,10 @@ mod tests {
     use super::*;
 
     fn gate(result: GateResult, fail_closed: bool) -> Gate {
-        Gate { result, fail_closed }
+        Gate {
+            result,
+            fail_closed,
+        }
     }
 
     // --- explicit precedence ---
