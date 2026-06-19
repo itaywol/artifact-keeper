@@ -143,6 +143,9 @@ ed25519-dalek = "2"
 # Search engine
 opensearch = { workspace = true }
 
+# Redis (curation verdict cache)
+redis = { workspace = true }
+
 # Temp files
 tempfile = "3.27"
 

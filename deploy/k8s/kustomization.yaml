@@ -1,0 +1,15 @@
+# Hand-rolled manifests for the PyPI + curation MVP (EKS, 2 replicas, ALB, S3
+# via IRSA, RDS Postgres, ElastiCache Redis). Replace <PLACEHOLDERS> before
+# applying, or drop this directory into platform-deployments as an ArgoCD
+# Application source.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: artifact-keeper
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - externalsecret.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml

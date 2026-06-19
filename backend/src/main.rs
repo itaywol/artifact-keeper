@@ -610,6 +610,21 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     app_state.set_metrics_handle(metrics_handle);
 
+    // Initialize the curation verdict cache (optional; graceful fallback).
+    if let Ok(redis_url) = std::env::var("REDIS_URL") {
+        match crate::services::curation_cache::VerdictCache::connect(&redis_url).await {
+            Ok(cache) => {
+                app_state.set_verdict_cache(Arc::new(cache));
+                tracing::info!("Curation verdict cache connected (Redis)");
+            }
+            Err(e) => tracing::warn!(
+                "REDIS_URL set but connection failed; curation runs without cache: {e}"
+            ),
+        }
+    } else {
+        tracing::info!("REDIS_URL unset; curation runs without verdict cache");
+    }
+
     // Initialize proxy service for remote repository caching
     match StorageService::from_config(&config).await {
         Ok(storage_svc) => {

@@ -11,6 +11,7 @@ pub mod validation;
 
 use crate::config::Config;
 use crate::services::artifact_service::ArtifactService;
+use crate::services::curation_cache::VerdictCache;
 use crate::services::dependency_track_service::DependencyTrackService;
 use crate::services::event_bus::EventBus;
 use crate::services::opensearch_service::OpenSearchService;
@@ -140,6 +141,9 @@ pub struct AppState {
     /// extra concurrent login starves the blocking-thread pool and the rest
     /// of the API degrades along with it (#991, #1088).
     pub auth_semaphore: Option<Arc<Semaphore>>,
+    /// Redis-backed curation verdict cache. `None` when `REDIS_URL` is unset
+    /// (curation degrades to per-request evaluation with no caching).
+    pub verdict_cache: Option<Arc<VerdictCache>>,
 }
 
 /// Build an auth-concurrency semaphore from a config value, or `None` when
@@ -195,6 +199,7 @@ impl AppState {
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             auth_semaphore,
+            verdict_cache: None,
         }
     }
 
@@ -237,6 +242,7 @@ impl AppState {
             signed_release_cache: Arc::new(RwLock::new(HashMap::new())),
             signed_release_cache_index: Arc::new(RwLock::new(HashMap::new())),
             auth_semaphore,
+            verdict_cache: None,
         }
     }
 
@@ -280,6 +286,10 @@ impl AppState {
     }
 
     /// Set the OpenSearch service for search indexing.
+    pub fn set_verdict_cache(&mut self, cache: Arc<VerdictCache>) {
+        self.verdict_cache = Some(cache);
+    }
+
     pub fn set_search_service(&mut self, search_service: Arc<OpenSearchService>) {
         self.search_service = Some(search_service);
     }

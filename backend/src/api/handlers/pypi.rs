@@ -1060,6 +1060,48 @@ async fn download_or_metadata(
     serve_file(&state, &repo, &repo_key, &project, &filename).await
 }
 
+/// Curation enforcement on the download path. Returns `Some(403)` when the
+/// Remote `remote_repo_id`'s curation policy blocks this version; `None` when
+/// allowed or no policy applies. Runs before the proxy cache so a previously
+/// cached but now-blocked version is still denied (defense in depth).
+async fn curation_gate_denies(
+    state: &SharedState,
+    remote_repo_id: uuid::Uuid,
+    upstream_url: &str,
+    project: &str,
+    filename: &str,
+) -> Option<Response> {
+    let version = PypiHandler::parse_filename(filename)
+        .ok()
+        .and_then(|i| i.version)?;
+    let http = reqwest::Client::new();
+    let gate = crate::services::curation_gate::CurationGate::new(
+        &state.db,
+        state.verdict_cache.as_deref(),
+        &http,
+    );
+    let policy = gate.load_policy(remote_repo_id).await?;
+    let normalized = PypiHandler::normalize_name(project);
+    let verdict = gate
+        .evaluate(&policy, upstream_url, &normalized, &version, None)
+        .await;
+    if verdict == crate::services::curation_eval::Verdict::Block {
+        let body = serde_json::json!({
+            "error": "blocked by curation policy",
+            "package": normalized,
+            "version": version,
+        });
+        return Some(
+            Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        );
+    }
+    None
+}
+
 async fn serve_file(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1092,6 +1134,11 @@ async fn serve_file(
                 if let (Some(ref upstream_url), Some(ref proxy)) =
                     (&repo.upstream_url, &state.proxy_service)
                 {
+                    if let Some(resp) =
+                        curation_gate_denies(state, repo.id, upstream_url, project, filename).await
+                    {
+                        return Ok(resp);
+                    }
                     // Try the proxy cache first using a predictable local
                     // path. This avoids fetching the simple index from upstream
                     // just to rediscover the download URL when the file is
@@ -1215,6 +1262,17 @@ async fn serve_file(
                         if let (Some(ref upstream_url), Some(ref proxy)) =
                             (&member.upstream_url, &state.proxy_service)
                         {
+                            if let Some(resp) = curation_gate_denies(
+                                state,
+                                member.id,
+                                upstream_url,
+                                project,
+                                filename,
+                            )
+                            .await
+                            {
+                                return Ok(resp);
+                            }
                             // Check proxy cache first (same optimization as the
                             // direct Remote path). This avoids re-fetching the
                             // simple index from upstream when the file is already

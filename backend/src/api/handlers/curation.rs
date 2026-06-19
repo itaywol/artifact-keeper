@@ -65,6 +65,11 @@ pub fn router() -> Router<SharedState> {
         .route("/packages/re-evaluate", post(re_evaluate))
         // Stats
         .route("/stats", get(stats))
+        // Inline curation policies (per Remote repo)
+        .route(
+            "/policies/{remote_repo_id}",
+            get(get_policy).put(upsert_policy).delete(delete_policy),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +511,100 @@ fn pkg_to_response(pkg: crate::models::curation::CurationPackage) -> PackageResp
         metadata: pkg.metadata,
         first_seen_at: pkg.first_seen_at.to_rfc3339(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Inline curation policies (per Remote repo)
+// ---------------------------------------------------------------------------
+
+/// Create/update body for a Remote repo's curation policy.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PolicyRequest {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub min_age_enabled: bool,
+    #[serde(default)]
+    pub min_age_days: Option<i32>,
+    #[serde(default)]
+    pub webhook_enabled: bool,
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    #[serde(default = "default_webhook_timeout")]
+    pub webhook_timeout_ms: i32,
+    #[serde(default = "default_fail_mode")]
+    pub webhook_fail_mode: String,
+    #[serde(default = "default_action")]
+    pub default_action: String,
+}
+
+fn default_webhook_timeout() -> i32 {
+    3000
+}
+fn default_fail_mode() -> String {
+    "closed".to_string()
+}
+fn default_action() -> String {
+    "allow".to_string()
+}
+
+async fn get_policy(
+    State(state): State<SharedState>,
+    Path(remote_repo_id): Path<Uuid>,
+) -> Result<Json<crate::models::curation::CurationPolicy>, AppError> {
+    let policy = sqlx::query_as::<_, crate::models::curation::CurationPolicy>(
+        "SELECT * FROM curation_policies WHERE remote_repo_id = $1",
+    )
+    .bind(remote_repo_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::NotFound("No curation policy for this repository".to_string()))?;
+    Ok(Json(policy))
+}
+
+async fn upsert_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(remote_repo_id): Path<Uuid>,
+    Json(req): Json<PolicyRequest>,
+) -> Result<Json<crate::models::curation::CurationPolicy>, AppError> {
+    auth.require_admin()?;
+    let policy = sqlx::query_as::<_, crate::models::curation::CurationPolicy>(
+        r#"INSERT INTO curation_policies
+           (remote_repo_id, enabled, min_age_enabled, min_age_days, webhook_enabled,
+            webhook_url, webhook_timeout_ms, webhook_fail_mode, default_action)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           ON CONFLICT (remote_repo_id) DO UPDATE SET
+             enabled = $2, min_age_enabled = $3, min_age_days = $4, webhook_enabled = $5,
+             webhook_url = $6, webhook_timeout_ms = $7, webhook_fail_mode = $8,
+             default_action = $9, updated_at = now()
+           RETURNING *"#,
+    )
+    .bind(remote_repo_id)
+    .bind(req.enabled)
+    .bind(req.min_age_enabled)
+    .bind(req.min_age_days)
+    .bind(req.webhook_enabled)
+    .bind(&req.webhook_url)
+    .bind(req.webhook_timeout_ms)
+    .bind(&req.webhook_fail_mode)
+    .bind(&req.default_action)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(Json(policy))
+}
+
+async fn delete_policy(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(remote_repo_id): Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    auth.require_admin()?;
+    sqlx::query("DELETE FROM curation_policies WHERE remote_repo_id = $1")
+        .bind(remote_repo_id)
+        .execute(&state.db)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
