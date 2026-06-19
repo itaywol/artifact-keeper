@@ -84,14 +84,35 @@ loses block/allow history beyond logs — revisit if debuggability hurts.
 
 ## Implementation plan
 
-- [ ] **M1** Migration `135_curation_policies.sql` + `CurationPolicy` model
-- [ ] **M2** Pure eval core: precedence + min-age predicate (unit-tested, no IO)
-- [ ] **M3** pypi.org `upload_time` fetch (PEP 691 JSON), cached
-- [ ] **M4** Redis verdict cache (client + TTL write-through) behind a trait
-- [ ] **M5** Webhook client (timeout, retry, fail-mode)
-- [ ] **M6** Wire into PyPI proxy: `/simple` filter + download block (Remote + via Virtual member)
-- [ ] **M7** Policy CRUD handlers + API
-- [ ] **M8** k8s manifests (Deployment×2, Service, ALB Ingress, ServiceAccount/IRSA, ExternalSecret) in platform-deployments
+- [x] **M1** Migration `135_curation_policies.sql` + `CurationPolicy` model
+- [x] **M2** Pure eval core: precedence + min-age predicate (13 tests, no IO)
+- [x] **M3** pypi.org `upload_time` fetch (PEP 691 JSON), cached (6 tests)
+- [x] **M4** Redis verdict cache (`curation_cache`, get/set + raw, live-Redis tests)
+- [x] **M5** Webhook client (`curation_webhook`, pure mapper + retry/fail-mode, axum-server tests)
+- [x] **M6** `curation_gate` orchestrator + download-path hard 403 gate (direct Remote + virtual member); AppState wiring + main.rs REDIS_URL init
+- [x] **M7** Policy CRUD: `GET/PUT/DELETE /api/v1/curation/policies/{remote_repo_id}` (admin-only)
+- [x] **M8** Hand-rolled k8s manifests in `deploy/k8s/` + lean `docker-compose.curation-dev.yml`
+
+Verified via nix-shell: clippy `-D warnings` clean, 42 curation tests pass, fmt clean.
+
+## Residual / follow-ups (not in this MVP)
+
+1. **`/simple` index filtering** — the download gate is the hard enforcement
+   (blocks the wheel/sdist with 403). The Remote path in `simple_project`
+   passes the upstream index through verbatim, so blocked versions still
+   *appear* in `pip index`/resolver listings; pip then 403s on download rather
+   than falling back to an older allowed version. Filtering requires parsing +
+   re-serializing the upstream HTML/JSON index per the gate. `allowed_versions`
+   helper exists in `curation_gate` ready to wire here.
+2. **Handler-path integration tests** — the gate logic is unit/integration
+   tested; the two `pypi.rs` insertions need axum-test coverage against a
+   seeded DB to satisfy the changed-lines coverage gate.
+3. **min-age fail mode** — currently always fail-closed (publish time unknown →
+   block). Add `min_age_fail_mode` column if a fail-open cooldown is wanted.
+4. **OpenAPI docs** for the policy endpoints (skipped `#[utoipa::path]`).
+5. **k8s manifests live in `deploy/k8s/` in this fork**, not in
+   `platform-deployments` — drop them in as an ArgoCD Application source when
+   ready; placeholders (`<ACCOUNT_ID>`, `<REGION>`, `<TAG>`, …) need filling.
 
 Gates per PR (CLAUDE.md): `cargo fmt` + `clippy -D warnings` + unit tests, ≥70%
 coverage on changed lines, ≤3% duplication.
