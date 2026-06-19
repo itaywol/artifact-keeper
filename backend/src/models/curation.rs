@@ -44,3 +44,28 @@ pub struct CurationPackage {
     pub first_seen_at: DateTime<Utc>,
     pub upstream_updated_at: Option<DateTime<Utc>>,
 }
+
+/// Inline curation policy attached to a Remote repository. Drives the min-age
+/// and webhook gates evaluated on the fetch path. Explicit allow/block lists
+/// live in [`CurationRule`].
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct CurationPolicy {
+    pub id: Uuid,
+    pub remote_repo_id: Uuid,
+    pub enabled: bool,
+
+    pub min_age_enabled: bool,
+    pub min_age_days: Option<i32>,
+
+    pub webhook_enabled: bool,
+    pub webhook_url: Option<String>,
+    pub webhook_timeout_ms: i32,
+    /// `"open"` or `"closed"`.
+    pub webhook_fail_mode: String,
+
+    /// `"allow"` or `"block"`.
+    pub default_action: String,
+
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

@@ -85,6 +85,7 @@ pub mod webhook_signing;
 // Observability & lifecycle
 pub mod analytics_service;
 pub mod crash_reporting_service;
+pub mod curation_eval;
 pub mod curation_service;
 pub mod curation_sync;
 pub mod health_monitor_service;
