@@ -612,7 +612,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
 
     // Initialize the curation verdict cache (optional; graceful fallback).
     if let Ok(redis_url) = std::env::var("REDIS_URL") {
-        match crate::services::curation_cache::VerdictCache::connect(&redis_url).await {
+        match artifact_keeper_backend::services::curation_cache::VerdictCache::connect(&redis_url)
+            .await
+        {
             Ok(cache) => {
                 app_state.set_verdict_cache(Arc::new(cache));
                 tracing::info!("Curation verdict cache connected (Redis)");
