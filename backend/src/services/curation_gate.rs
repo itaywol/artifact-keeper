@@ -201,7 +201,8 @@ impl<'a> CurationGate<'a> {
         sha256: Option<&str>,
     ) -> Verdict {
         if let Some(cache) = self.cache {
-            if let Some(c) = cache.get(ECOSYSTEM, package, version).await {
+            let repo_id = policy.remote_repo_id.to_string();
+            if let Some(c) = cache.get(&repo_id, ECOSYSTEM, package, version).await {
                 return c.verdict;
             }
         }
@@ -275,14 +276,18 @@ impl<'a> CurationGate<'a> {
         let ttl = cache_ttl(explicit, min_age_days, age_days, webhook);
 
         if let Some(cache) = self.cache {
+            let repo_id = policy.remote_repo_id.to_string();
             cache
                 .set(
+                    &repo_id,
                     ECOSYSTEM,
                     package,
                     version,
                     &CachedVerdict {
                         verdict: res.verdict,
                         reason: res.reason.clone(),
+                        package: package.to_string(),
+                        version: version.to_string(),
                     },
                     ttl,
                 )
@@ -310,7 +315,10 @@ impl<'a> CurationGate<'a> {
             // Reuse the per-version Redis verdict where present, else evaluate
             // against the already-fetched upload-times map.
             let cached = match self.cache {
-                Some(cache) => cache.get(ECOSYSTEM, package, v).await,
+                Some(cache) => {
+                    let repo_id = policy.remote_repo_id.to_string();
+                    cache.get(&repo_id, ECOSYSTEM, package, v).await
+                }
                 None => None,
             };
             let verdict = match cached {

@@ -70,6 +70,10 @@ pub fn router() -> Router<SharedState> {
             "/policies/:remote_repo_id",
             get(get_policy).put(upsert_policy).delete(delete_policy),
         )
+        .route(
+            "/policies/:remote_repo_id/blocked",
+            get(list_blocked_versions),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +595,10 @@ async fn upsert_policy(
     .bind(&req.default_action)
     .fetch_one(&state.db)
     .await?;
+    // Invalidate cached verdicts so the new policy takes effect immediately.
+    if let Some(cache) = &state.verdict_cache {
+        cache.invalidate_repo(&remote_repo_id.to_string()).await;
+    }
     Ok(Json(policy))
 }
 
@@ -604,7 +612,37 @@ async fn delete_policy(
         .bind(remote_repo_id)
         .execute(&state.db)
         .await?;
+    if let Some(cache) = &state.verdict_cache {
+        cache.invalidate_repo(&remote_repo_id.to_string()).await;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A blocked version surfaced from the verdict cache.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BlockedVersion {
+    pub package: String,
+    pub version: String,
+    pub reason: String,
+}
+
+async fn list_blocked_versions(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path(remote_repo_id): Path<Uuid>,
+) -> Result<Json<Vec<BlockedVersion>>, AppError> {
+    auth.require_admin()?;
+    let mut out = Vec::new();
+    if let Some(cache) = &state.verdict_cache {
+        for v in cache.list_blocked(&remote_repo_id.to_string()).await {
+            out.push(BlockedVersion {
+                package: v.package,
+                version: v.version,
+                reason: v.reason,
+            });
+        }
+    }
+    Ok(Json(out))
 }
 
 #[cfg(test)]
