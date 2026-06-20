@@ -116,3 +116,49 @@ Verified via nix-shell: clippy `-D warnings` clean, 42 curation tests pass, fmt 
 
 Gates per PR (CLAUDE.md): `cargo fmt` + `clippy -D warnings` + unit tests, ≥70%
 coverage on changed lines, ≤3% duplication.
+
+---
+
+# Production readiness
+
+## P0 — blockers
+- **Build & publish OUR image.** Manifests point at `ghcr.io/artifact-keeper/...`
+  (upstream, no curation code). Build the fork backend + push to a registry you
+  control; pin the tag in `deploy/k8s/deployment.yaml`.
+- **Redis is effectively required.** It's optional/graceful, but with no cache
+  every fetch re-runs the webhook + pypi.org JSON call → latency + upstream load.
+  Provision ElastiCache, set `REDIS_URL` secret, decide fail behavior if Redis is down.
+- **SSRF on webhook_url + upstream fetch.** Admin-set `webhook_url` and the
+  upstream `upload_times` GET let the server hit arbitrary URLs. Reuse the
+  existing webhook SSRF guard (block loopback/metadata/private IPs) for both.
+- **Scheduler HA.** 2 replicas double-run GC/lifecycle (no leader election).
+  Wrap those jobs in `pg_try_advisory_lock` before scaling >1 (pattern exists at
+  `scheduler_service.rs:238`).
+- **Coverage gate.** Handler insertions (`pypi.rs`, `main.rs`) + redis-backed
+  cache methods aren't covered by non-live tests. Add axum-test integration
+  tests (seeded PG + Redis) and a Redis service to CI Tier-2.
+
+## P1 — should-have
+- **`/simple` index filtering.** Today blocked versions still appear in the
+  index → pip 403s instead of resolving to an allowed version. Wire
+  `allowed_versions` into `simple_project` (HTML + PEP 691 JSON).
+- **Webhook request signing.** Sign AK→webhook POSTs (HMAC) so the policy
+  service can authenticate the caller. Currently unauthenticated.
+- **Metrics + alerts.** Emit curation decision counters (allow/block), webhook
+  latency, and **fail-open events** (a fired fail-open = guard was down — alert).
+- **min-age fail mode** configurable (column + UI); currently always fail-closed.
+- **DB pool sizing** vs RDS `max_connections` (2 replicas × pool ≤ max).
+
+## P2 — nice-to-have
+- **Durable verdict/audit log** (Postgres) — Redis-only loses block history on
+  eviction; blocked-list only reflects cached+within-TTL. Add if audit needed.
+- **OpenAPI** for the new endpoints (skipped `#[utoipa::path]`) → regenerate SDK.
+- **Multi-format.** `ecosystem` is hardcoded `"pypi"`; generalize for npm/maven/…
+- **Upstream latent bug:** existing `/rules/{id}`, `/packages/{id}` curation
+  routes use axum-0.8 brace syntax under axum 0.7 → dead routes (rule CRUD).
+  Fix to `:param` (separate from this feature; affects existing curation rules UI).
+
+## Process
+- Open PRs: `feat/pypi-curation-mvp` (backend), `feat/curation-ui` (web). Per
+  workflow: parent Linear issue + sub-issues, `[ECH-XXXX]` titles.
+- Decide: contribute upstream vs maintain private fork.
