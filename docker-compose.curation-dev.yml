@@ -154,7 +154,9 @@ services:
       backend:
         condition: service_healthy
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:18080
+      # Empty -> browser calls same-origin /api/* which the Next middleware
+      # proxies to BACKEND_URL. Avoids cross-origin/CORS ("failed to fetch").
+      NEXT_PUBLIC_API_URL: ""
       BACKEND_URL: http://backend:8080
       NODE_ENV: development
       WATCHPACK_POLLING: "true"
