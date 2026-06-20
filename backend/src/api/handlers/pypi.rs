@@ -906,10 +906,12 @@ fn build_simple_project_response(
 
     for a in artifacts {
         let filename = a.path.rsplit('/').next().unwrap_or(&a.path);
-        let url = format!(
-            "/pypi/{}/simple/{}/{}#sha256={}",
-            repo_key, normalized, filename, a.checksum_sha256
-        );
+        // Relative href (filename only). The project page is served at
+        // `/pypi/{repo}/simple/{name}/`, so a bare filename resolves to the
+        // same URL for pip — but unlike a root-absolute path it also works
+        // through upstream proxies (e.g. JFrog Artifactory), which cannot
+        // reverse-map `/pypi/.../simple/...` and 404 on download otherwise.
+        let url = format!("{}#sha256={}", filename, a.checksum_sha256);
 
         let requires_python = a
             .metadata
@@ -973,10 +975,12 @@ fn merge_local_into_remote_simple_html(
         if existing.contains(filename) {
             continue;
         }
-        let url = format!(
-            "/pypi/{}/simple/{}/{}#sha256={}",
-            repo_key, normalized, filename, a.checksum_sha256
-        );
+        // Relative href (filename only). The project page is served at
+        // `/pypi/{repo}/simple/{name}/`, so a bare filename resolves to the
+        // same URL for pip — but unlike a root-absolute path it also works
+        // through upstream proxies (e.g. JFrog Artifactory), which cannot
+        // reverse-map `/pypi/.../simple/...` and 404 on download otherwise.
+        let url = format!("{}#sha256={}", filename, a.checksum_sha256);
         let requires_python = a
             .metadata
             .as_ref()
@@ -1082,24 +1086,85 @@ async fn curation_gate_denies(
     );
     let policy = gate.load_policy(remote_repo_id).await?;
     let normalized = PypiHandler::normalize_name(project);
-    let verdict = gate
-        .evaluate(&policy, upstream_url, &normalized, &version, None)
+    let ev = gate
+        .evaluate_explained(&policy, upstream_url, &normalized, &version, None)
         .await;
-    if verdict == crate::services::curation_eval::Verdict::Block {
-        let body = serde_json::json!({
-            "error": "blocked by curation policy",
-            "package": normalized,
-            "version": version,
-        });
-        return Some(
-            Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        );
+    if ev.verdict != crate::services::curation_eval::Verdict::Block {
+        return None;
     }
-    None
+
+    // Turn the internal reason into something a developer can act on: name the
+    // package/version, say *why*, and — for the min-age gate — give the actual
+    // age, the required age, and when it will unblock.
+    let message = curation_block_message(&normalized, &version, &ev);
+    let body = serde_json::json!({
+        "error": "blocked by curation policy",
+        "message": message,
+        "reason": ev.reason,
+        "package": normalized,
+        "version": version,
+        "policy": {
+            "min_age_days": ev.min_age_days,
+            "package_age_days": ev.age_days.map(|a| (a * 10.0).round() / 10.0),
+        },
+    });
+    Some(
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(CONTENT_TYPE, "application/json")
+            // Surfaced in `pip install -v` / curl -i even though pip hides the
+            // JSON body on a 403.
+            .header("X-Curation-Blocked", "1")
+            .header(
+                "X-Curation-Reason",
+                http_header_safe(&message),
+            )
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+}
+
+/// Human-readable explanation for a curation block, with concrete numbers for
+/// the min-age gate so the caller knows exactly when the version unblocks.
+fn curation_block_message(
+    package: &str,
+    version: &str,
+    ev: &crate::services::curation_gate::ExplainedVerdict,
+) -> String {
+    let base = format!("{package} {version} is blocked by this repository's curation policy");
+    if ev.reason.starts_with("min-age") {
+        if let Some(min) = ev.min_age_days {
+            return match ev.age_days {
+                Some(age) => {
+                    let remaining = (min as f64 - age).max(0.0);
+                    format!(
+                        "{base}: it was published {age:.1} day(s) ago but the policy requires a \
+                         minimum age of {min} day(s). It becomes installable in ~{remaining:.1} day(s)."
+                    )
+                }
+                None => format!(
+                    "{base}: its upstream publish time is unknown and the {min}-day minimum-age \
+                     policy fails closed. It will unblock once the publish time is known and \
+                     {min} day(s) have passed."
+                ),
+            };
+        }
+    }
+    if ev.reason.starts_with("webhook") {
+        return format!("{base}: a policy webhook rejected this version ({}).", ev.reason);
+    }
+    if ev.reason.starts_with("explicit") {
+        return format!("{base}: an explicit block rule matches this package/version.");
+    }
+    format!("{base} ({}).", ev.reason)
+}
+
+/// Collapse a message to a single-line, ASCII-safe value usable as an HTTP
+/// header (no CR/LF, no bytes outside 0x20..=0x7e).
+fn http_header_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| if (' '..='~').contains(&c) { c } else { ' ' })
+        .collect()
 }
 
 async fn serve_file(
@@ -2098,9 +2163,11 @@ fn find_upstream_url_for_file(
 ///   - External PyPI: `<a href="https://files.pythonhosted.org/packages/...">`
 ///   - Local AK repos: `<a href="/pypi/upstream-key/simple/pkg/file#hash">`
 ///
-/// This function rewrites both forms to paths under the current (remote) repo:
-/// `/pypi/{repo_key}/simple/{project}/{filename}#sha256=...` so downloads go
-/// through Artifact Keeper and get cached.
+/// This function rewrites both forms to a relative filename href
+/// (`{filename}#sha256=...`) which resolves against the current project page
+/// (`/pypi/{repo_key}/simple/{project}/`) — so downloads go through Artifact
+/// Keeper and get cached, while also surviving an upstream proxy (e.g. JFrog)
+/// that cannot reverse-map a root-absolute `/pypi/...` path.
 ///
 /// Absolute URLs (`http://`, `https://`) and root-relative paths starting with
 /// `/pypi/` are rewritten. Plain relative URLs and anchors are left unchanged.
@@ -2111,9 +2178,7 @@ fn find_upstream_url_for_file(
 /// Keeping these attributes would cause pip to request a `.metadata` URL that
 /// returns 404, which pip treats as a hard error since the index promised the
 /// metadata was available.
-fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
-    let normalized = PypiHandler::normalize_name(project);
-
+fn rewrite_upstream_urls(html: &str, _repo_key: &str, _project: &str) -> String {
     REWRITE_RE
         .replace_all(html, |caps: &regex::Captures| {
             let before_href = &caps[1];
@@ -2134,10 +2199,10 @@ fn rewrite_upstream_urls(html: &str, repo_key: &str, project: &str) -> String {
                 return caps[0].to_string();
             }
 
-            let rewritten = format!(
-                "/pypi/{}/simple/{}/{}{}",
-                repo_key, normalized, filename, fragment
-            );
+            // Relative href (filename only) so downloads resolve under the
+            // current project page for pip AND survive an upstream proxy like
+            // JFrog, which cannot reverse-map a root-absolute `/pypi/...` path.
+            let rewritten = format!("{}{}", filename, fragment);
 
             // Strip PEP 658 metadata attributes. The proxy does not cache or
             // serve .metadata files, so advertising them causes pip to fail
@@ -2429,7 +2494,7 @@ mod tests {
         let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
         assert_eq!(
             result,
-            r#"<a href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a>"#
+            r#"<a href="numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a>"#
         );
     }
 
@@ -2439,7 +2504,7 @@ mod tests {
         let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
         assert_eq!(
             result,
-            r#"<a href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz">numpy-1.3.0.tar.gz</a>"#
+            r#"<a href="numpy-1.3.0.tar.gz">numpy-1.3.0.tar.gz</a>"#
         );
     }
 
@@ -2449,8 +2514,7 @@ mod tests {
         // (previously these were left unchanged, which broke Nexus/devpi remotes)
         let html = r#"<a href="numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a>"#;
         let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
-        assert!(result
-            .contains(r#"href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc123""#));
+        assert!(result.contains(r#"href="numpy-1.3.0.tar.gz#sha256=abc123""#));
     }
 
     #[test]
@@ -2461,21 +2525,17 @@ mod tests {
             r#"<a href="https://files.pythonhosted.org/packages/numpy-1.4.0-cp39-cp39-manylinux1_x86_64.whl#sha256=bbb">numpy-1.4.0-cp39-cp39-manylinux1_x86_64.whl</a><br/>"#,
         );
         let result = rewrite_upstream_urls(html, "my-pypi", "numpy");
-        assert!(
-            result.contains(r#"href="/pypi/my-pypi/simple/numpy/numpy-1.3.0.tar.gz#sha256=aaa""#)
-        );
+        assert!(result.contains(r#"href="numpy-1.3.0.tar.gz#sha256=aaa""#));
         assert!(result.contains(
-            r#"href="/pypi/my-pypi/simple/numpy/numpy-1.4.0-cp39-cp39-manylinux1_x86_64.whl#sha256=bbb""#
+            r#"href="numpy-1.4.0-cp39-cp39-manylinux1_x86_64.whl#sha256=bbb""#
         ));
     }
 
     #[test]
-    fn test_rewrite_normalizes_project_name() {
+    fn test_rewrite_keeps_filename_verbatim() {
         let html = r#"<a href="https://example.com/My_Package-1.0.tar.gz#sha256=abc">My_Package-1.0.tar.gz</a>"#;
         let result = rewrite_upstream_urls(html, "pypi-remote", "My_Package");
-        assert!(result.contains(
-            r#"href="/pypi/pypi-remote/simple/my-package/My_Package-1.0.tar.gz#sha256=abc""#
-        ));
+        assert!(result.contains(r#"href="My_Package-1.0.tar.gz#sha256=abc""#));
     }
 
     #[test]
@@ -2484,7 +2544,7 @@ mod tests {
         let result = rewrite_upstream_urls(html, "repo", "pkg");
         assert_eq!(
             result,
-            r#"<a href="/pypi/repo/simple/pkg/pkg-1.0.tar.gz">pkg-1.0.tar.gz</a>"#
+            r#"<a href="pkg-1.0.tar.gz">pkg-1.0.tar.gz</a>"#
         );
     }
 
@@ -2492,8 +2552,7 @@ mod tests {
     fn test_rewrite_preserves_data_attributes() {
         let html = r#"<a href="https://files.pythonhosted.org/packages/numpy-1.3.0.tar.gz#sha256=abc" data-requires-python="&gt;=3.7">numpy-1.3.0.tar.gz</a>"#;
         let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
-        assert!(result
-            .contains(r#"href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc""#));
+        assert!(result.contains(r#"href="numpy-1.3.0.tar.gz#sha256=abc""#));
         assert!(result.contains(r#"data-requires-python="&gt;=3.7""#));
     }
 
@@ -2526,10 +2585,9 @@ mod tests {
 
         // Absolute URLs should be rewritten
         assert!(!result.contains("files.pythonhosted.org"));
-        assert!(result
-            .contains(r#"href="/pypi/pypi-public/simple/numpy/numpy-1.3.0.tar.gz#sha256=aaa111""#));
+        assert!(result.contains(r#"href="numpy-1.3.0.tar.gz#sha256=aaa111""#));
         assert!(result.contains(
-            r#"href="/pypi/pypi-public/simple/numpy/numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=bbb222""#
+            r#"href="numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=bbb222""#
         ));
 
         // data-requires-python should be preserved
@@ -2548,10 +2606,10 @@ mod tests {
             r#"<a href="pkg-2.0.tar.gz#sha256=bbb">pkg-2.0.tar.gz</a>"#,
         );
         let result = rewrite_upstream_urls(html, "repo", "pkg");
-        // Absolute URL is rewritten
-        assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.tar.gz#sha256=aaa""#));
-        // Relative URL is now also rewritten (needed for Nexus/devpi remotes)
-        assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-2.0.tar.gz#sha256=bbb""#));
+        // Absolute URL is rewritten to relative filename
+        assert!(result.contains(r#"href="pkg-1.0.tar.gz#sha256=aaa""#));
+        // Relative URL is normalized too (needed for Nexus/devpi remotes)
+        assert!(result.contains(r#"href="pkg-2.0.tar.gz#sha256=bbb""#));
     }
 
     #[test]
@@ -2559,7 +2617,7 @@ mod tests {
         // URLs from real PyPI have deep paths like /packages/3e/ee/ab/...
         let html = r#"<a href="https://files.pythonhosted.org/packages/3e/ee/ab/cd/ef/numpy-1.3.0.tar.gz#sha256=abc">numpy-1.3.0.tar.gz</a>"#;
         let result = rewrite_upstream_urls(html, "repo", "numpy");
-        assert!(result.contains(r#"href="/pypi/repo/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc""#));
+        assert!(result.contains(r#"href="numpy-1.3.0.tar.gz#sha256=abc""#));
     }
 
     #[test]
@@ -2567,7 +2625,7 @@ mod tests {
         let html =
             r#"<a href="https://example.com/pkg-1.0.tar.gz#md5=deadbeef">pkg-1.0.tar.gz</a>"#;
         let result = rewrite_upstream_urls(html, "repo", "pkg");
-        assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.tar.gz#md5=deadbeef""#));
+        assert!(result.contains(r#"href="pkg-1.0.tar.gz#md5=deadbeef""#));
     }
 
     #[test]
@@ -2578,7 +2636,7 @@ mod tests {
         let result = rewrite_upstream_urls(html, "pypi-remote", "numpy");
         assert_eq!(
             result,
-            r#"<a href="/pypi/pypi-remote/simple/numpy/numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a>"#
+            r#"<a href="numpy-1.3.0.tar.gz#sha256=abc123">numpy-1.3.0.tar.gz</a>"#
         );
     }
 
@@ -2588,7 +2646,7 @@ mod tests {
         let result = rewrite_upstream_urls(html, "remote-repo", "pkg");
         assert_eq!(
             result,
-            r#"<a href="/pypi/remote-repo/simple/pkg/pkg-2.0.whl">pkg-2.0.whl</a>"#
+            r#"<a href="pkg-2.0.whl">pkg-2.0.whl</a>"#
         );
     }
 
@@ -2597,7 +2655,7 @@ mod tests {
         let html = r#"<a href="/pypi/upstream/simple/numpy/numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.whl#sha256=bbb" data-requires-python="&gt;=3.9">numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.whl</a>"#;
         let result = rewrite_upstream_urls(html, "my-remote", "numpy");
         assert!(result.contains(
-            r#"href="/pypi/my-remote/simple/numpy/numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.whl#sha256=bbb""#
+            r#"href="numpy-2.0.0-cp312-cp312-manylinux_2_17_x86_64.whl#sha256=bbb""#
         ));
         assert!(result.contains(r#"data-requires-python="&gt;=3.9""#));
     }
@@ -2612,18 +2670,12 @@ mod tests {
             r#"<a href="numpy-3.0.0.tar.gz#sha256=ccc">numpy-3.0.0.tar.gz</a>"#,
         );
         let result = rewrite_upstream_urls(html, "remote", "numpy");
-        // Absolute URL is rewritten
-        assert!(
-            result.contains(r#"href="/pypi/remote/simple/numpy/numpy-1.3.0.tar.gz#sha256=aaa""#)
-        );
+        // Absolute URL is rewritten to relative filename
+        assert!(result.contains(r#"href="numpy-1.3.0.tar.gz#sha256=aaa""#));
         // Root-relative /pypi/ URL is rewritten
-        assert!(
-            result.contains(r#"href="/pypi/remote/simple/numpy/numpy-2.0.0.tar.gz#sha256=bbb""#)
-        );
-        // Plain relative URL is now also rewritten (needed for Nexus/devpi)
-        assert!(
-            result.contains(r#"href="/pypi/remote/simple/numpy/numpy-3.0.0.tar.gz#sha256=ccc""#)
-        );
+        assert!(result.contains(r#"href="numpy-2.0.0.tar.gz#sha256=bbb""#));
+        // Plain relative URL is normalized too (needed for Nexus/devpi)
+        assert!(result.contains(r#"href="numpy-3.0.0.tar.gz#sha256=ccc""#));
     }
 
     #[test]
@@ -2644,13 +2696,11 @@ mod tests {
 "#;
         let result = rewrite_upstream_urls(html, "remote-pypi", "mypackage");
 
-        // Local upstream URLs should be rewritten to use the remote repo key
+        // Local upstream URLs should be rewritten to relative filenames
         assert!(!result.contains("local-pypi"));
+        assert!(result.contains(r#"href="mypackage-1.0.0.tar.gz#sha256=aaa111""#));
         assert!(result.contains(
-            r#"href="/pypi/remote-pypi/simple/mypackage/mypackage-1.0.0.tar.gz#sha256=aaa111""#
-        ));
-        assert!(result.contains(
-            r#"href="/pypi/remote-pypi/simple/mypackage/mypackage-1.0.0-py3-none-any.whl#sha256=bbb222""#
+            r#"href="mypackage-1.0.0-py3-none-any.whl#sha256=bbb222""#
         ));
 
         // data-requires-python and other structure should be preserved
@@ -2666,7 +2716,7 @@ mod tests {
         let html = r#"<a href="https://files.pythonhosted.org/packages/d9/5a/six-1.16.0-py2.py3-none-any.whl#sha256=8abb" data-requires-python="&gt;=2.7" data-dist-info-metadata="sha256=5507" data-core-metadata="sha256=5507">six-1.16.0-py2.py3-none-any.whl</a>"#;
         let result = rewrite_upstream_urls(html, "pypi-proxy", "six");
         assert!(result.contains(
-            r#"href="/pypi/pypi-proxy/simple/six/six-1.16.0-py2.py3-none-any.whl#sha256=8abb""#
+            r#"href="six-1.16.0-py2.py3-none-any.whl#sha256=8abb""#
         ));
         // data-requires-python should be preserved
         assert!(result.contains(r#"data-requires-python="&gt;=2.7""#));
@@ -2693,11 +2743,9 @@ mod tests {
         // URLs should be rewritten
         assert!(!result.contains("files.pythonhosted.org"));
         assert!(result.contains(
-            r#"href="/pypi/pypi-proxy/simple/six/six-1.17.0-py2.py3-none-any.whl#sha256=4721""#
+            r#"href="six-1.17.0-py2.py3-none-any.whl#sha256=4721""#
         ));
-        assert!(
-            result.contains(r#"href="/pypi/pypi-proxy/simple/six/six-1.17.0.tar.gz#sha256=ff70""#)
-        );
+        assert!(result.contains(r#"href="six-1.17.0.tar.gz#sha256=ff70""#));
 
         // data-requires-python should be preserved on both links
         assert!(result.contains("data-requires-python"));
@@ -2715,7 +2763,7 @@ mod tests {
         // Edge case: metadata attribute appears before href
         let html = r#"<a data-dist-info-metadata="sha256=abc" href="https://example.com/pkg-1.0.whl#sha256=def">pkg-1.0.whl</a>"#;
         let result = rewrite_upstream_urls(html, "repo", "pkg");
-        assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.whl#sha256=def""#));
+        assert!(result.contains(r#"href="pkg-1.0.whl#sha256=def""#));
         assert!(!result.contains("data-dist-info-metadata"));
     }
 
@@ -2734,9 +2782,7 @@ mod tests {
         // Nexus-style relative href should be rewritten to local proxy path
         let html = r#"<a href="../../packages/requests-2.31.0.tar.gz#sha256=abc">requests-2.31.0.tar.gz</a>"#;
         let result = rewrite_upstream_urls(html, "pypi-remote", "requests");
-        assert!(result.contains(
-            r#"href="/pypi/pypi-remote/simple/requests/requests-2.31.0.tar.gz#sha256=abc""#
-        ));
+        assert!(result.contains(r#"href="requests-2.31.0.tar.gz#sha256=abc""#));
     }
 
     #[test]
@@ -2745,7 +2791,7 @@ mod tests {
         let html =
             r#"<a href="/packages/ab/cd/six-1.16.0.tar.gz#sha256=abc">six-1.16.0.tar.gz</a>"#;
         let result = rewrite_upstream_urls(html, "repo", "six");
-        assert!(result.contains(r#"href="/pypi/repo/simple/six/six-1.16.0.tar.gz#sha256=abc""#));
+        assert!(result.contains(r#"href="six-1.16.0.tar.gz#sha256=abc""#));
     }
 
     #[test]
@@ -2753,9 +2799,7 @@ mod tests {
         // Plain relative href (packages/file.tar.gz) from devpi
         let html = r#"<a href="packages/pkg-1.0.tar.gz#sha256=abc">pkg-1.0.tar.gz</a>"#;
         let result = rewrite_upstream_urls(html, "devpi-remote", "pkg");
-        assert!(
-            result.contains(r#"href="/pypi/devpi-remote/simple/pkg/pkg-1.0.tar.gz#sha256=abc""#)
-        );
+        assert!(result.contains(r#"href="pkg-1.0.tar.gz#sha256=abc""#));
     }
 
     #[test]
@@ -2766,9 +2810,9 @@ mod tests {
             r#"<a href="../../packages/pkg-1.0.tar.gz#sha256=bbb">pkg-1.0.tar.gz</a>"#,
         );
         let result = rewrite_upstream_urls(html, "repo", "pkg");
-        // Both should be rewritten to local proxy paths
-        assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.whl#sha256=aaa""#));
-        assert!(result.contains(r#"href="/pypi/repo/simple/pkg/pkg-1.0.tar.gz#sha256=bbb""#));
+        // Both should be rewritten to relative filenames
+        assert!(result.contains(r#"href="pkg-1.0.whl#sha256=aaa""#));
+        assert!(result.contains(r#"href="pkg-1.0.tar.gz#sha256=bbb""#));
     }
 
     // -----------------------------------------------------------------------
@@ -4037,9 +4081,16 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
 
+        // Href is relative (filename only); it resolves against the virtual
+        // repo's own project-page URL, so it can never leak a member's key.
         assert!(
-            html.contains("/pypi/pypi-virtual/simple/my-package/my_package-1.0.0.tar.gz"),
-            "URL should use the virtual repo key, got: {}",
+            html.contains(r#"href="my_package-1.0.0.tar.gz"#),
+            "URL should be a relative filename, got: {}",
+            html
+        );
+        assert!(
+            !html.contains("/pypi/"),
+            "Href must not contain a root-absolute /pypi/ path, got: {}",
             html
         );
         assert!(
@@ -4118,8 +4169,8 @@ mod tests {
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
 
-        assert!(html.contains("/pypi/vrepo/simple/pkg/pkg-1.0.0.tar.gz#sha256=aaa"));
-        assert!(html.contains("/pypi/vrepo/simple/pkg/pkg-2.0.0.tar.gz#sha256=bbb"));
+        assert!(html.contains(r#"href="pkg-1.0.0.tar.gz#sha256=aaa""#));
+        assert!(html.contains(r#"href="pkg-2.0.0.tar.gz#sha256=bbb""#));
     }
 
     // -----------------------------------------------------------------------
@@ -4714,8 +4765,8 @@ mod tests {
             "local entry spliced in"
         );
         assert!(
-            merged.contains("/pypi/virt/simple/pkg/pkg-2.0.0-py3-none-any.whl#sha256=ffeeddccbbaa99887766554433221100"),
-            "local URL uses the virtual repo key and carries the sha256 fragment"
+            merged.contains(r#"href="pkg-2.0.0-py3-none-any.whl#sha256=ffeeddccbbaa99887766554433221100""#),
+            "local URL is a relative filename carrying the sha256 fragment"
         );
         // Spliced before </body> so the document is still well-formed.
         let body_idx = merged.find("</body>").expect("</body> still present");
@@ -4801,6 +4852,45 @@ mod tests {
         let merged = merge_local_into_remote_simple_html(&remote, "virt", "pkg", &local, &[]);
         assert!(merged.contains("pkg-1.0.0.tar.gz"));
         assert!(merged.contains("pkg-2.0.0-py3-none-any.whl"));
+    }
+
+    // -----------------------------------------------------------------------
+    // curation_block_message — actionable 403 text
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_curation_block_message_min_age_with_numbers() {
+        let ev = crate::services::curation_gate::ExplainedVerdict {
+            verdict: crate::services::curation_eval::Verdict::Block,
+            reason: "min-age: version too new".to_string(),
+            age_days: Some(3.0),
+            min_age_days: Some(14),
+        };
+        let msg = curation_block_message("requests", "2.31.0", &ev);
+        assert!(msg.contains("requests 2.31.0"));
+        assert!(msg.contains("3.0 day"));
+        assert!(msg.contains("14 day"));
+        assert!(msg.contains("11.0 day(s)"), "remaining = 14 - 3: {msg}");
+    }
+
+    #[test]
+    fn test_curation_block_message_min_age_unknown_time() {
+        let ev = crate::services::curation_gate::ExplainedVerdict {
+            verdict: crate::services::curation_eval::Verdict::Block,
+            reason: "min-age: publish time unknown (fail-closed)".to_string(),
+            age_days: None,
+            min_age_days: Some(7),
+        };
+        let msg = curation_block_message("flask", "3.0.0", &ev);
+        assert!(msg.contains("publish time is unknown"));
+        assert!(msg.contains("7-day"));
+    }
+
+    #[test]
+    fn test_http_header_safe_strips_control_and_nonascii() {
+        assert_eq!(http_header_safe("ok line"), "ok line");
+        assert_eq!(http_header_safe("bad\r\ninjected"), "bad  injected");
+        assert_eq!(http_header_safe("caf\u{e9}"), "caf ");
     }
 
     // -----------------------------------------------------------------------

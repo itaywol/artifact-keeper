@@ -85,6 +85,17 @@ pub fn cache_ttl(
     DEFAULT_ALLOW_TTL
 }
 
+/// A verdict plus the facts behind it, for building an actionable client
+/// error when a download is blocked.
+pub struct ExplainedVerdict {
+    pub verdict: Verdict,
+    pub reason: String,
+    /// Age of this version in days, when the upstream publish time is known.
+    pub age_days: Option<f64>,
+    /// Configured minimum age in days, when the min-age gate is enabled.
+    pub min_age_days: Option<i64>,
+}
+
 /// Build the PEP 691 JSON simple-index URL for a project on an upstream.
 pub fn simple_json_url(upstream_url: &str, package: &str) -> String {
     let base = upstream_url.trim_end_matches('/');
@@ -200,10 +211,32 @@ impl<'a> CurationGate<'a> {
         version: &str,
         sha256: Option<&str>,
     ) -> Verdict {
+        self.evaluate_explained(policy, upstream_url, package, version, sha256)
+            .await
+            .verdict
+    }
+
+    /// Like [`evaluate`], but returns the reason and the facts (age, configured
+    /// minimum age) so the caller can build an actionable client error.
+    pub async fn evaluate_explained(
+        &self,
+        policy: &CurationPolicy,
+        upstream_url: &str,
+        package: &str,
+        version: &str,
+        sha256: Option<&str>,
+    ) -> ExplainedVerdict {
         if let Some(cache) = self.cache {
             let repo_id = policy.remote_repo_id.to_string();
             if let Some(c) = cache.get(&repo_id, ECOSYSTEM, package, version).await {
-                return c.verdict;
+                // Cached verdicts don't carry the age; the reason text still
+                // explains why, and min_age_days comes from the live policy.
+                return ExplainedVerdict {
+                    verdict: c.verdict,
+                    reason: c.reason,
+                    age_days: None,
+                    min_age_days: policy.min_age_days.map(|d| d as i64),
+                };
             }
         }
 
@@ -225,7 +258,7 @@ impl<'a> CurationGate<'a> {
         version: &str,
         sha256: Option<&str>,
         times: &HashMap<String, DateTime<Utc>>,
-    ) -> Verdict {
+    ) -> ExplainedVerdict {
         let explicit = self
             .explicit_lookup(policy.remote_repo_id, package, version)
             .await;
@@ -293,7 +326,12 @@ impl<'a> CurationGate<'a> {
                 )
                 .await;
         }
-        res.verdict
+        ExplainedVerdict {
+            verdict: res.verdict,
+            reason: res.reason,
+            age_days,
+            min_age_days,
+        }
     }
 
     /// Filter a version list to those allowed by the policy. Fetches upstream
@@ -326,6 +364,7 @@ impl<'a> CurationGate<'a> {
                 None => {
                     self.evaluate_uncached(policy, package, v, None, &times)
                         .await
+                        .verdict
                 }
             };
             if verdict == Verdict::Allow {
