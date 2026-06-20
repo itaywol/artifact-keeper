@@ -77,5 +77,102 @@ services:
         HTTPServer(("0.0.0.0", 8080), H).serve_forever()
     restart: unless-stopped
 
+  # Artifact Keeper backend, built from this branch's source (so the curation
+  # feature is present). First boot compiles the workspace (~10 min); the cargo
+  # target + registry are cached in volumes so re-ups are fast.
+  backend:
+    image: rust:1.96-bookworm
+    container_name: ak-curation-backend
+    working_dir: /app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        if [ ! -x /usr/local/bin/protoc ]; then
+          apt-get update >/dev/null && apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev curl unzip ca-certificates >/dev/null
+          ARCH=$$(uname -m); case "$$ARCH" in
+            x86_64) PA=linux-x86_64 ;; aarch64) PA=linux-aarch_64 ;;
+          esac
+          # Official protoc release bundles the well-known types (google/protobuf/*)
+          # that the apt package does not expose to tonic-build.
+          curl -sSfL "https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-$$PA.zip" -o /tmp/p.zip
+          unzip -oq /tmp/p.zip -d /usr/local && rm /tmp/p.zip
+        fi
+        exec cargo run --bin artifact-keeper
+    environment:
+      DATABASE_URL: postgresql://registry:registry@postgres:5432/artifact_registry
+      REDIS_URL: redis://redis:6379
+      HOST: 0.0.0.0
+      PORT: 8080
+      ENVIRONMENT: development
+      STORAGE_BACKEND: filesystem
+      STORAGE_PATH: /data/storage
+      BACKUP_PATH: /data/backups
+      PLUGINS_DIR: /data/plugins
+      JWT_SECRET: "dev-jwt-secret-change-in-production-0123456789abcdef"
+      MIGRATION_ENCRYPTION_KEY: "dev-migration-encryption-key-change-me-0123456789"
+      AK_WEBHOOK_SECRET_KEY: "m5edf7szmKWP9xxAVW/nONeh0PCOoEVqcx5sTGrQcs8="
+      ADMIN_PASSWORD: "ChangeMe-Curation-12345!"
+      ALLOW_HTTP_INTEGRATIONS: "1"
+      CORS_ORIGINS: "http://localhost:3000,http://localhost:8080"
+      RUST_LOG: "info,artifact_keeper=debug"
+      SQLX_OFFLINE: "true"
+      CARGO_TARGET_DIR: /target
+    volumes:
+      - ./backend:/app/backend:cached
+      - ./Cargo.toml:/app/Cargo.toml:cached
+      - ./Cargo.lock:/app/Cargo.lock:cached
+      - ./.sqlx:/app/.sqlx:cached
+      - curation_cargo_registry:/usr/local/cargo/registry
+      - curation_cargo_target:/target
+      - curation_storage:/data
+    ports:
+      - "18080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/livez || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 60
+      start_period: 900s
+    restart: unless-stopped
+
+  # Web UI (Next.js) from the artifact-keeper-web fork. Curation has no UI yet —
+  # use it to browse repos/artifacts; manage curation via the API for now.
+  web:
+    build:
+      context: ../artifact-keeper-web
+      dockerfile: Dockerfile.dev
+    container_name: ak-curation-web
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:18080
+      BACKEND_URL: http://backend:8080
+      NODE_ENV: development
+      WATCHPACK_POLLING: "true"
+    volumes:
+      - ../artifact-keeper-web/src:/app/src:cached
+      - ../artifact-keeper-web/public:/app/public:cached
+      - ../artifact-keeper-web/next.config.ts:/app/next.config.ts:cached
+      - ../artifact-keeper-web/tsconfig.json:/app/tsconfig.json:cached
+      - ../artifact-keeper-web/components.json:/app/components.json:cached
+      - ../artifact-keeper-web/postcss.config.mjs:/app/postcss.config.mjs:cached
+      - curation_web_node_modules:/app/node_modules
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
 volumes:
   curation_pg_data:
+  curation_cargo_registry:
+  curation_cargo_target:
+  curation_storage:
+  curation_web_node_modules:

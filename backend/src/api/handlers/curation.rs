@@ -67,7 +67,7 @@ pub fn router() -> Router<SharedState> {
         .route("/stats", get(stats))
         // Inline curation policies (per Remote repo)
         .route(
-            "/policies/{remote_repo_id}",
+            "/policies/:remote_repo_id",
             get(get_policy).put(upsert_policy).delete(delete_policy),
         )
 }
